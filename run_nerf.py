@@ -1,4 +1,5 @@
 import os, sys
+from PIL import Image
 import numpy as np
 import imageio
 import json
@@ -74,7 +75,7 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
     Args:
       H: int. Height of image in pixels.
       W: int. Width of image in pixels.
-      focal: float. Focal length of pinhole camera.
+      K: ndarray[float]. Focal length of pinhole camera.
       chunk: int. Maximum number of rays to process simultaneously. Used to
         control maximum memory usage. Does not affect final results.
       rays: array of shape [2, batch_size, 3]. Ray origin and direction for
@@ -128,7 +129,7 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
         k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
         all_ret[k] = torch.reshape(all_ret[k], k_sh)
 
-    k_extract = ['rgb_map', 'disp_map', 'acc_map']
+    k_extract = ['rgb_map', 'disp_map', 'acc_map', 'depth_map']
     ret_list = [all_ret[k] for k in k_extract]
     ret_dict = {k : all_ret[k] for k in all_ret if k not in k_extract}
     return ret_list + [ret_dict]
@@ -146,14 +147,16 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
 
     rgbs = []
     disps = []
+    depth = []
 
     t = time.time()
     for i, c2w in enumerate(tqdm(render_poses)):
         print(i, time.time() - t)
         t = time.time()
-        rgb, disp, acc, _ = render(H, W, K, chunk=chunk, c2w=c2w[:3,:4], **render_kwargs)
+        rgb, disp, acc, depth = render(H, W, K, chunk=chunk, c2w=c2w[:3,:4], **render_kwargs)
         rgbs.append(rgb.cpu().numpy())
         disps.append(disp.cpu().numpy())
+        depth.append(depth.cpu().numpy())
         if i==0:
             print(rgb.shape, disp.shape)
 
@@ -171,8 +174,9 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
 
     rgbs = np.stack(rgbs, 0)
     disps = np.stack(disps, 0)
+    depths = np.stack(depths, 0)
 
-    return rgbs, disps
+    return rgbs, disps, depths
 
 
 def create_nerf(args):
@@ -188,14 +192,14 @@ def create_nerf(args):
     skips = [4]
     model = NeRF(D=args.netdepth, W=args.netwidth,
                  input_ch=input_ch, output_ch=output_ch, skips=skips,
-                 input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
+                 input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(args.device)
     grad_vars = list(model.parameters())
 
     model_fine = None
     if args.N_importance > 0:
         model_fine = NeRF(D=args.netdepth_fine, W=args.netwidth_fine,
                           input_ch=input_ch, output_ch=output_ch, skips=skips,
-                          input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
+                          input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(args.device)
         grad_vars += list(model_fine.parameters())
 
     network_query_fn = lambda inputs, viewdirs, network_fn : run_network(inputs, viewdirs, network_fn,
@@ -225,13 +229,15 @@ def create_nerf(args):
         ckpt = torch.load(ckpt_path)
 
         start = ckpt['global_step']
-        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        try:
+            optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        except ValueError as e: 
+            print("Couldn't load optimizer state {}".format(e))
 
         # Load model
         model.load_state_dict(ckpt['network_fn_state_dict'])
         if model_fine is not None:
             model_fine.load_state_dict(ckpt['network_fine_state_dict'])
-
     ##########################
 
     render_kwargs_train = {
@@ -387,7 +393,7 @@ def render_rays(ray_batch,
 
     if N_importance > 0:
 
-        rgb_map_0, disp_map_0, acc_map_0 = rgb_map, disp_map, acc_map
+        rgb_map_0, disp_map_0, acc_map_0, depth_map0 = rgb_map, disp_map, acc_map, depth_map
 
         z_vals_mid = .5 * (z_vals[...,1:] + z_vals[...,:-1])
         z_samples = sample_pdf(z_vals_mid, weights[...,1:-1], N_importance, det=(perturb==0.), pytest=pytest)
@@ -402,13 +408,14 @@ def render_rays(ray_batch,
 
         rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
-    ret = {'rgb_map' : rgb_map, 'disp_map' : disp_map, 'acc_map' : acc_map}
+    ret = {'rgb_map' : rgb_map, 'disp_map' : disp_map, 'acc_map' : acc_map, 'depth_map': depth_map}
     if retraw:
         ret['raw'] = raw
     if N_importance > 0:
         ret['rgb0'] = rgb_map_0
         ret['disp0'] = disp_map_0
         ret['acc0'] = acc_map_0
+        ret['depth_map0'] = depth_map0
         ret['z_std'] = torch.std(z_samples, dim=-1, unbiased=False)  # [N_rays]
 
     for k in ret:
@@ -519,7 +526,7 @@ def config_parser():
     # logging/saving options
     parser.add_argument("--i_print",   type=int, default=100, 
                         help='frequency of console printout and metric loggin')
-    parser.add_argument("--i_img",     type=int, default=500, 
+    parser.add_argument("--i_img",     type=int, default=100, 
                         help='frequency of tensorboard image logging')
     parser.add_argument("--i_weights", type=int, default=10000, 
                         help='frequency of weight ckpt saving')
@@ -535,6 +542,7 @@ def train():
 
     parser = config_parser()
     args = parser.parse_args()
+    args.device = device 
 
     # Load data
     K = None
@@ -571,8 +579,8 @@ def train():
         print('Loaded blender', images.shape, render_poses.shape, hwf, args.datadir)
         i_train, i_val, i_test = i_split
 
-        near = 2.
-        far = 6.
+        near = 1.
+        far = 200.
 
         if args.white_bkgd:
             images = images[...,:3]*images[...,-1:] + (1.-images[...,-1:])
@@ -636,6 +644,8 @@ def train():
         with open(f, 'w') as file:
             file.write(open(args.config, 'r').read())
 
+    print("EXPNAME: {}, basedir: {}".format(expname, basedir))
+
     # Create nerf model
     render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(args)
     global_step = start
@@ -648,7 +658,7 @@ def train():
     render_kwargs_test.update(bds_dict)
 
     # Move testing data to GPU
-    render_poses = torch.Tensor(render_poses).to(device)
+    render_poses = torch.Tensor(render_poses).to(args.device)
 
     # Short circuit if only rendering out from trained model
     if args.render_only:
@@ -665,7 +675,7 @@ def train():
             os.makedirs(testsavedir, exist_ok=True)
             print('test poses shape', render_poses.shape)
 
-            rgbs, _ = render_path(render_poses, hwf, K, args.chunk, render_kwargs_test, gt_imgs=images, savedir=testsavedir, render_factor=args.render_factor)
+            rgbs, _, _ = render_path(render_poses, hwf, K, args.chunk, render_kwargs_test, gt_imgs=images, savedir=testsavedir, render_factor=args.render_factor)
             print('Done rendering', testsavedir)
             imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'), to8b(rgbs), fps=30, quality=8)
 
@@ -692,10 +702,10 @@ def train():
 
     # Move training data to GPU
     if use_batching:
-        images = torch.Tensor(images).to(device)
-    poses = torch.Tensor(poses).to(device)
+        images = torch.Tensor(images).to(args.device)
+    poses = torch.Tensor(poses).to(args.device)
     if use_batching:
-        rays_rgb = torch.Tensor(rays_rgb).to(device)
+        rays_rgb = torch.Tensor(rays_rgb).to(args.device)
 
 
     N_iters = 200000 + 1
@@ -703,6 +713,7 @@ def train():
     print('TRAIN views are', i_train)
     print('TEST views are', i_test)
     print('VAL views are', i_val)
+
 
     # Summary writers
     # writer = SummaryWriter(os.path.join(basedir, 'summaries', expname))
@@ -729,7 +740,7 @@ def train():
             # Random from one image
             img_i = np.random.choice(i_train)
             target = images[img_i]
-            target = torch.Tensor(target).to(device)
+            target = torch.Tensor(target).to(args.device)
             pose = poses[img_i, :3,:4]
 
             if N_rand is not None:
@@ -802,8 +813,8 @@ def train():
         if i%args.i_video==0 and i > 0:
             # Turn on testing mode
             with torch.no_grad():
-                rgbs, disps = render_path(render_poses, hwf, K, args.chunk, render_kwargs_test)
-            print('Done, saving', rgbs.shape, disps.shape)
+                rgbs, disps, depths = render_path(render_poses, hwf, K, args.chunk, render_kwargs_test)
+            print('Done, saving', rgbs.shape, disps.shape, depths.shape)
             moviebase = os.path.join(basedir, expname, '{}_spiral_{:06d}_'.format(expname, i))
             imageio.mimwrite(moviebase + 'rgb.mp4', to8b(rgbs), fps=30, quality=8)
             imageio.mimwrite(moviebase + 'disp.mp4', to8b(disps / np.max(disps)), fps=30, quality=8)
@@ -820,54 +831,69 @@ def train():
             os.makedirs(testsavedir, exist_ok=True)
             print('test poses shape', poses[i_test].shape)
             with torch.no_grad():
-                render_path(torch.Tensor(poses[i_test]).to(device), hwf, K, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
+                render_path(torch.Tensor(poses[i_test]).to(args.device), hwf, K, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
             print('Saved test set')
-
-
     
         if i%args.i_print==0:
             tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
-        """
-            print(expname, i, psnr.numpy(), loss.numpy(), global_step.numpy())
-            print('iter time {:.05f}'.format(dt))
+            # print(expname, i, psnr.numpy(), loss.numpy(), global_step.numpy())
+            # print('iter time {:.05f}'.format(dt))
 
-            with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_print):
-                tf.contrib.summary.scalar('loss', loss)
-                tf.contrib.summary.scalar('psnr', psnr)
-                tf.contrib.summary.histogram('tran', trans)
-                if args.N_importance > 0:
-                    tf.contrib.summary.scalar('psnr0', psnr0)
+            # with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_print):
+            #     tf.contrib.summary.scalar('loss', loss)
+            #     tf.contrib.summary.scalar('psnr', psnr)
+            #     tf.contrib.summary.histogram('tran', trans)
+            #     if args.N_importance > 0:
+            #         tf.contrib.summary.scalar('psnr0', psnr0)
 
 
             if i%args.i_img==0:
-
+                
                 # Log a rendered validation view to Tensorboard
                 img_i=np.random.choice(i_val)
                 target = images[img_i]
                 pose = poses[img_i, :3,:4]
                 with torch.no_grad():
-                    rgb, disp, acc, extras = render(H, W, focal, chunk=args.chunk, c2w=pose,
+                    rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, c2w=pose,
                                                         **render_kwargs_test)
 
-                psnr = mse2psnr(img2mse(rgb, target))
+                psnr = mse2psnr(img2mse(rgb, torch.tensor(target).to(rgb.device)))
 
-                with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_img):
+                path = os.path.join(basedir, expname, "imgs")
+                if not os.path.exists(path):
+                    os.mkdir(path)
+                
+                rgb = Image.fromarray(to8b(rgb.cpu().numpy()))
+                rgb.save(os.path.join(path, 'coarse_rgb_iter_{}_psnr_{}.png'.format(i, psnr.cpu().numpy()[0])))
+                
+                disp = visualize_depth(disp)
+                disp = Image.fromarray(disp.numpy())
+                disp.save(os.path.join(path, 'coarse_disp_iter_{}_psnr_{}.png'.format(i, psnr.cpu().numpy()[0])))
 
-                    tf.contrib.summary.image('rgb', to8b(rgb)[tf.newaxis])
-                    tf.contrib.summary.image('disp', disp[tf.newaxis,...,tf.newaxis])
-                    tf.contrib.summary.image('acc', acc[tf.newaxis,...,tf.newaxis])
 
-                    tf.contrib.summary.scalar('psnr_holdout', psnr)
-                    tf.contrib.summary.image('rgb_holdout', target[tf.newaxis])
+                # with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_img):
+
+                #     tf.contrib.summary.image('rgb', to8b(rgb)[tf.newaxis])
+                #     tf.contrib.summary.image('disp', disp[tf.newaxis,...,tf.newaxis])
+                #     tf.contrib.summary.image('acc', acc[tf.newaxis,...,tf.newaxis])
+
+                #     tf.contrib.summary.scalar('psnr_holdout', psnr)
+                #     tf.contrib.summary.image('rgb_holdout', target[tf.newaxis])
 
 
                 if args.N_importance > 0:
+                    rgb = Image.fromarray(to8b(extras['rgb0'].cpu().numpy()))
+                    rgb.save(os.path.join(path, 'fine_rgb_epoch_{}_psnr_{}.png'.format(i, psnr.cpu().numpy()[0])))
+                    
+                    disp = visualize_depth(extras['disp0'])
+                    disp = Image.fromarray(disp.numpy())
+                    disp.save(os.path.join(path, 'fine_disp_epoch_{}_psnr_{}.png'.format(i, psnr.cpu().numpy()[0])))
 
-                    with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_img):
-                        tf.contrib.summary.image('rgb0', to8b(extras['rgb0'])[tf.newaxis])
-                        tf.contrib.summary.image('disp0', extras['disp0'][tf.newaxis,...,tf.newaxis])
-                        tf.contrib.summary.image('z_std', extras['z_std'][tf.newaxis,...,tf.newaxis])
-        """
+
+                    # with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_img):
+                    #     tf.contrib.summary.image('rgb0', to8b(extras['rgb0'])[tf.newaxis])
+                    #     tf.contrib.summary.image('disp0', extras['disp0'][tf.newaxis,...,tf.newaxis])
+                    #     tf.contrib.summary.image('z_std', extras['z_std'][tf.newaxis,...,tf.newaxis])
 
         global_step += 1
 

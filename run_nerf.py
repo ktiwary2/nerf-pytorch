@@ -147,16 +147,16 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
 
     rgbs = []
     disps = []
-    depth = []
+    depths = []
 
     t = time.time()
     for i, c2w in enumerate(tqdm(render_poses)):
         print(i, time.time() - t)
         t = time.time()
-        rgb, disp, acc, depth = render(H, W, K, chunk=chunk, c2w=c2w[:3,:4], **render_kwargs)
+        rgb, disp, acc, depth, _ = render(H, W, K, chunk=chunk, c2w=c2w[:3,:4], **render_kwargs)
         rgbs.append(rgb.cpu().numpy())
         disps.append(disp.cpu().numpy())
-        depth.append(depth.cpu().numpy())
+        depths.append(depth.cpu().numpy())
         if i==0:
             print(rgb.shape, disp.shape)
 
@@ -168,13 +168,19 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
 
         if savedir is not None:
             rgb8 = to8b(rgbs[-1])
+            disp8 = to8b(disps[-1] / np.max(disps[-1]))
+            depth8 = visualize_depth(depth, to_tensor=False)
             filename = os.path.join(savedir, '{:03d}.png'.format(i))
             imageio.imwrite(filename, rgb8)
+            filename = os.path.join(savedir, 'disp_{:03d}.png'.format(i))
+            imageio.imwrite(filename, disp8)
+            filename = os.path.join(savedir, 'depth_{:03d}.png'.format(i))
+            imageio.imwrite(filename, depth8)
 
 
     rgbs = np.stack(rgbs, 0)
     disps = np.stack(disps, 0)
-    depths = np.stack(depths, 0)
+    # depths = np.stack(depths, 0)
 
     return rgbs, disps, depths
 

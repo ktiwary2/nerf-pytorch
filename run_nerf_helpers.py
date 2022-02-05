@@ -12,7 +12,7 @@ img2mse = lambda x, y : torch.mean((x - y) ** 2)
 mse2psnr = lambda x : -10. * torch.log(x) / torch.log(torch.Tensor([10.]))
 to8b = lambda x : (255*np.clip(x,0,1)).astype(np.uint8)
 
-def visualize_depth(depth, cmap=cv2.COLORMAP_JET):
+def visualize_depth(depth, to_tensor=True, cmap=cv2.COLORMAP_JET):
     """
     depth: (H, W)
     """
@@ -23,9 +23,13 @@ def visualize_depth(depth, cmap=cv2.COLORMAP_JET):
     x = (x-mi)/(ma-mi+1e-8) # normalize to 0~1
     x = (255*x).astype(np.uint8)
     x_ = Image.fromarray(cv2.applyColorMap(x, cmap))
-    x_ = T.ToTensor()(x_) # (3, H, W)
-    x_ = x_.permute(1,2,0).to(torch.uint8)
-    return x_
+    if to_tensor:
+        x_ = T.ToTensor()(x_) # (3, H, W)
+        x_ = x_.permute(1,2,0).to(torch.uint8)
+        return x_
+    else: 
+        x_ = np.asarray(x_)
+        return x_
 
 # Positional encoding (section 5.1)
 class Embedder:

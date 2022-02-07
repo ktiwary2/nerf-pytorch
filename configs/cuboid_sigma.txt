@@ -1,0 +1,19 @@
+expname = blender_one_cuboid
+basedir = ./logs
+datadir = ../../datasets/volumetric/results_500_v2_distance_transform_150/
+dataset_type = blender_sm
+
+no_batching = True
+
+use_viewdirs = True
+white_bkgd = True
+lrate_decay = 500
+
+N_samples = 128
+N_importance = 128
+N_rand = 2048
+
+precrop_iters = 500
+precrop_frac = 0.5
+
+half_res = True

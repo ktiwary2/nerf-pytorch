@@ -1,7 +1,7 @@
 expname = blender_one_cuboid
 basedir = ./logs
-datadir = ../datasets/volumetric/results_500
-dataset_type = blender
+datadir = ../../datasets/volumetric/results_500_light_inside_bounding_vol_v1/
+dataset_type = blender_sm
 
 no_batching = True
 
@@ -9,9 +9,9 @@ use_viewdirs = True
 white_bkgd = True
 lrate_decay = 500
 
-N_samples = 64
+N_samples = 128
 N_importance = 128
-N_rand = 1024
+N_rand = 2048
 
 precrop_iters = 500
 precrop_frac = 0.5

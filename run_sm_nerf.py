@@ -2,6 +2,7 @@ import os, sys
 from PIL import Image
 import numpy as np
 import imageio
+import copy
 import json
 import random
 import time
@@ -19,6 +20,8 @@ from load_deepvoxels import load_dv_data
 from load_blender import load_blender_data
 from load_LINEMOD import load_LINEMOD_data
 from load_blender_shadows import load_blender_shadows
+from shadow_mapping import efficient_sm_simple
+from camera import Camera
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 np.random.seed(0)
@@ -153,12 +156,24 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
     for i, c2w in enumerate(tqdm(render_poses)):
         print(i, time.time() - t)
         t = time.time()
-        rgb, disp, acc, depth, _ = render(H, W, K, chunk=chunk, c2w=c2w[:3,:4], **render_kwargs)
-        rgbs.append(rgb.cpu().numpy())
-        disps.append(disp.cpu().numpy())
-        depths.append(depth.cpu().numpy())
+        # Render Camera Rays 
+        rgb_cam, disp_cam, acc_cam, depth_cam, _ = render(H, W, K, chunk=chunk, c2w=c2w[:3,:4], **render_kwargs)
+        
+        # Change arguments here to do sm...
+        # Render Light Rays 
+        # rgb_light, disp_light, acc_light, depth_light, _ = render(H, W, K, chunk=chunk, c2w=l2w[:3,:4], **render_kwargs)
+
+        sm_coarse = None
+        # sm_coarse = efficient_sm_simple(cam_pixels, light_pixels, depth_cam, depth_light, ppc, light_ppc, (H,W), 'shadow_method_1')
+        # sm_fine = efficient_sm_simple(cam_pixels, light_pixels, depth_cam, depth_light, ppc, light_ppc, (H,W), 'shadow_method_1')
+
+        # short circuiting rgb to show shadow_maps 
+        rgbs.append(rgb_cam.cpu().numpy())
+        # rgbs.append(sm_fine.cpu().numpy())
+        disps.append(disp_cam.cpu().numpy())
+        depths.append(depth_cam.cpu().numpy())
         if i==0:
-            print(rgb.shape, disp.shape)
+            print(rgb_cam.shape, disp_cam.shape)
 
         """
         if gt_imgs is not None and render_factor==0:
@@ -169,7 +184,7 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
         if savedir is not None:
             rgb8 = to8b(rgbs[-1])
             disp8 = to8b(disps[-1] / np.max(disps[-1]))
-            depth8 = visualize_depth(depth, to_tensor=False)
+            depth8 = visualize_depth(depth_cam, to_tensor=False)
             filename = os.path.join(savedir, '{:03d}.png'.format(i))
             imageio.imwrite(filename, rgb8)
             filename = os.path.join(savedir, 'disp_{:03d}.png'.format(i))
@@ -180,7 +195,7 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
 
     rgbs = np.stack(rgbs, 0)
     disps = np.stack(disps, 0)
-    # depths = np.stack(depths, 0)
+    depths = np.stack(depths, 0)
 
     return rgbs, disps, depths
 
@@ -441,7 +456,7 @@ def config_parser():
                         help='experiment name')
     parser.add_argument("--basedir", type=str, default='./logs/', 
                         help='where to store ckpts and logs')
-    parser.add_argument("--datadir", type=str, default='./data/llff/fern', 
+    parser.add_argument("--datadir", type=str, default='../../datasets/volumetric/results_500_light_inside_bounding_vol_v1/', 
                         help='input data directory')
 
     # training options
@@ -502,7 +517,7 @@ def config_parser():
                         default=.5, help='fraction of img taken for central crops') 
 
     # dataset options
-    parser.add_argument("--dataset_type", type=str, default='llff', 
+    parser.add_argument("--dataset_type", type=str, default='blender_sm', 
                         help='options: llff / blender / deepvoxels')
     parser.add_argument("--testskip", type=int, default=8, 
                         help='will load 1/N images from test/val sets, useful for large datasets like deepvoxels')
@@ -549,38 +564,12 @@ def train():
     parser = config_parser()
     args = parser.parse_args()
     args.device = device 
+    print("Using device", args.device)
 
     # Load data
     K = None
-    if args.dataset_type == 'llff':
-        images, poses, bds, render_poses, i_test = load_llff_data(args.datadir, args.factor,
-                                                                  recenter=True, bd_factor=.75,
-                                                                  spherify=args.spherify)
-        hwf = poses[0,:3,-1]
-        poses = poses[:,:3,:4]
-        print('Loaded llff', images.shape, render_poses.shape, hwf, args.datadir)
-        if not isinstance(i_test, list):
-            i_test = [i_test]
 
-        if args.llffhold > 0:
-            print('Auto LLFF holdout,', args.llffhold)
-            i_test = np.arange(images.shape[0])[::args.llffhold]
-
-        i_val = i_test
-        i_train = np.array([i for i in np.arange(int(images.shape[0])) if
-                        (i not in i_test and i not in i_val)])
-
-        print('DEFINING BOUNDS')
-        if args.no_ndc:
-            near = np.ndarray.min(bds) * .9
-            far = np.ndarray.max(bds) * 1.
-            
-        else:
-            near = 0.
-            far = 1.
-        print('NEAR FAR', near, far)
-
-    elif args.dataset_type == 'blender':
+    if args.dataset_type == 'blender':
         images, poses, render_poses, hwf, i_split = load_blender_data(args.datadir, args.half_res, args.testskip)
         print('Loaded blender', images.shape, render_poses.shape, hwf, args.datadir)
         i_train, i_val, i_test = i_split
@@ -593,42 +582,19 @@ def train():
         else:
             images = images[...,:3]
 
-    elif args.dataset_type == 'LINEMOD':
-        images, poses, render_poses, hwf, K, i_split, near, far = load_LINEMOD_data(args.datadir, args.half_res, args.testskip)
-        print(f'Loaded LINEMOD, images shape: {images.shape}, hwf: {hwf}, K: {K}')
-        print(f'[CHECK HERE] near: {near}, far: {far}.')
-        i_train, i_val, i_test = i_split
-
-        if args.white_bkgd:
-            images = images[...,:3]*images[...,-1:] + (1.-images[...,-1:])
-        else:
-            images = images[...,:3]
-
-    elif args.dataset_type == 'deepvoxels':
-
-        images, poses, render_poses, hwf, i_split = load_dv_data(scene=args.shape,
-                                                                 basedir=args.datadir,
-                                                                 testskip=args.testskip)
-
-        print('Loaded deepvoxels', images.shape, render_poses.shape, hwf, args.datadir)
-        i_train, i_val, i_test = i_split
-
-        hemi_R = np.mean(np.linalg.norm(poses[:,:3,-1], axis=-1))
-        near = hemi_R-1.
-        far = hemi_R+1.
-
     elif args.dataset_type == 'blender_sm':
+        print('Loading Blender Shadows...')
+        images, poses, render_poses, hwf, i_split, light_camera_focal, l2w = load_blender_shadows(args.datadir, args.half_res, args.testskip)
+        # if args.white_bkgd:
+        #     images = images[...,:3]*images[...,-1:] + (1.-images[...,-1:])
+        # else:
+        #     images = images[...,:3]
 
-        images, poses, render_poses, hwf, i_split = load_blender_shadows(scene=args.shape,
-                                                                 basedir=args.datadir,
-                                                                 testskip=args.testskip)
-
-        print('Loaded Blender Shadows', images.shape, render_poses.shape, hwf, args.datadir)
+        print('Loaded Blender Shadows', images.shape, render_poses.shape, hwf, args.datadir, light_camera_focal)
         i_train, i_val, i_test = i_split
 
-        hemi_R = np.mean(np.linalg.norm(poses[:,:3,-1], axis=-1))
-        near = hemi_R-1.
-        far = hemi_R+1.
+        near = 1.
+        far = 200.
 
     else:
         print('Unknown dataset type', args.dataset_type, 'exiting')
@@ -643,6 +609,11 @@ def train():
         K = np.array([
             [focal, 0, 0.5*W],
             [0, focal, 0.5*H],
+            [0, 0, 1]
+        ])
+        K_light = np.array([
+            [light_camera_focal, 0, 0.5*W],
+            [0, light_camera_focal, 0.5*H],
             [0, 0, 1]
         ])
 
@@ -674,10 +645,45 @@ def train():
         'far' : far,
     }
     render_kwargs_train.update(bds_dict)
+    # render_kwargs_train_light = copy.deepcopy(render_kwargs_train)
+    # render_kwargs_train_light['N_importance'] = 0 #int(render_kwargs_train['N_importance']/2)
     render_kwargs_test.update(bds_dict)
 
     # Move testing data to GPU
     render_poses = torch.Tensor(render_poses).to(args.device)
+    # get light rays 
+    l2w = l2w[:3,:4]
+    rays_o, rays_d = get_rays(H, W, K_light, l2w)  # (H, W, 3), (H, W, 3)
+
+    CROP_LIGHT = True
+    if CROP_LIGHT:
+        dH = int(H//2 * args.precrop_frac)
+        dW = int(W//2 * args.precrop_frac)
+        pixels_u = torch.linspace(H//2 - dH, H//2 + dH - 1, 2*dH)
+        pixels_v = torch.linspace(W//2 - dW, W//2 + dW - 1, 2*dW)
+        i, j = np.meshgrid(pixels_v.cpu().numpy(), pixels_u.cpu().numpy(), indexing='xy')
+        i = torch.tensor(i)
+        j = torch.tensor(j)
+        light_pixels = torch.stack([i,j, torch.ones_like(i)], -1).view(-1, 3) # (H*W,3)
+        print("Cropping Light...")                
+    else:
+        pixels_u = torch.arange(0, w, 1)
+        pixels_v = torch.arange(0, h, 1)
+        i, j = np.meshgrid(pixels_v.cpu().numpy(), pixels_u.cpu().numpy(), indexing='xy')
+        i = torch.tensor(i) # + 0.5 #.unsqueeze(2) 
+        j = torch.tensor(j) #+ 0.5 #.unsqueeze(2)
+        light_pixels = torch.stack([i,j, torch.ones_like(i)], axis=-1).view(-1, 3) # (H*W,3)
+    
+    rays_o = rays_o[i.long(), j.long()]  # (H * W, 3)
+    rays_d = rays_d[i.long(), j.long()]  # (H * W, 3)
+    light_rays = torch.stack([rays_o, rays_d], 0).to(args.device)
+    light_pixels = light_pixels.to(args.device)
+    print("light_pixels",light_pixels)
+
+    light_ppc = Camera(light_camera_focal, (H,W))
+    light_ppc.set_pose_using_blender_matrix(l2w.to(args.device), False)
+    light_ppc.camera.to(args.device)
+    print("Light Characteristics: ", light_pixels.shape, light_rays.shape)
 
     # Short circuit if only rendering out from trained model
     if args.render_only:
@@ -704,6 +710,7 @@ def train():
     N_rand = args.N_rand
     use_batching = not args.no_batching
     if use_batching:
+        raise NotImplementedError("Cannot use batching yet... ")
         # For random ray batching
         print('get rays')
         rays = np.stack([get_rays_np(H, W, K, p) for p in poses[:,:3,:4]], 0) # [N, ro+rd, H, W, 3]
@@ -723,9 +730,10 @@ def train():
     if use_batching:
         images = torch.Tensor(images).to(args.device)
     poses = torch.Tensor(poses).to(args.device)
+    l2w = l2w.to(args.device)
+
     if use_batching:
         rays_rgb = torch.Tensor(rays_rgb).to(args.device)
-
 
     N_iters = 200000 + 1
     print('Begin')
@@ -736,7 +744,11 @@ def train():
 
     # Summary writers
     # writer = SummaryWriter(os.path.join(basedir, 'summaries', expname))
-    
+    # with torch.no_grad():
+    #     _, _, _, depth_light, _ = render(H, W, K_light, chunk=args.chunk, rays=light_rays,
+    #                                             verbose=i < 10, retraw=True,
+    #                                             **render_kwargs_train)
+
     start = start + 1
     for i in trange(start, N_iters):
         time0 = time.time()
@@ -761,6 +773,10 @@ def train():
             target = images[img_i]
             target = torch.Tensor(target).to(args.device)
             pose = poses[img_i, :3,:4]
+            # get ppc for the pose
+            ppc = Camera(focal, (H, W))
+            # print(pose.shape)
+            ppc.set_pose_using_blender_matrix(torch.tensor(pose.view(3,4)), False)
 
             if N_rand is not None:
                 rays_o, rays_d = get_rays(H, W, K, torch.Tensor(pose))  # (H, W, 3), (H, W, 3)
@@ -774,9 +790,21 @@ def train():
                             torch.linspace(W//2 - dW, W//2 + dW - 1, 2*dW)
                         ), -1)
                     if i == start:
-                        print(f"[Config] Center cropping of size {2*dH} x {2*dW} is enabled until iter {args.precrop_iters}")                
+                        print(f"[Config] Center cropping of size {2*dH} x {2*dW} is enabled until iter {args.precrop_iters}")
+                    pixels_u = torch.linspace(H//2 - dH, H//2 + dH - 1, 2*dH)
+                    pixels_v = torch.linspace(W//2 - dW, W//2 + dW - 1, 2*dW)
+                    i_, j_ = np.meshgrid(pixels_v.cpu().numpy(), pixels_u.cpu().numpy(), indexing='xy')
+                    i_ = torch.tensor(i_)
+                    j_ = torch.tensor(j_)
+                    cam_pixels = torch.stack([i_,j_, torch.ones_like(i_)], -1).view(-1, 3) # (H*W,3)
                 else:
                     coords = torch.stack(torch.meshgrid(torch.linspace(0, H-1, H), torch.linspace(0, W-1, W)), -1)  # (H, W, 2)
+                    pixels_u = torch.arange(0, W, 1)
+                    pixels_v = torch.arange(0, H, 1)
+                    i_, j_ = np.meshgrid(pixels_v.cpu().numpy(), pixels_u.cpu().numpy(), indexing='xy')
+                    i_ = torch.tensor(i_) # + 0.5 #.unsqueeze(2) 
+                    j_ = torch.tensor(j_) #+ 0.5 #.unsqueeze(2)
+                    cam_pixels = torch.stack([i_,j_, torch.ones_like(i_)], axis=-1).view(-1, 3) # (H*W,3)
 
                 coords = torch.reshape(coords, [-1,2])  # (H * W, 2)
                 select_inds = np.random.choice(coords.shape[0], size=[N_rand], replace=False)  # (N_rand,)
@@ -785,19 +813,34 @@ def train():
                 rays_d = rays_d[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
                 batch_rays = torch.stack([rays_o, rays_d], 0)
                 target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
+                # print(cam_pixels)
+                cam_pixels = cam_pixels[select_inds].to(args.device)
+                # cam_pixels = torch.stack([select_coords[:, 0],select_coords[:, 1], torch.ones_like(select_coords[:, 0])], axis=-1).view(-1, 3)
+                # print(cam_pixels)
+                # raise
 
         #####  Core optimization loop  #####
-        rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
+        # Render Camera Rays 
+        rgb_cam, disp_cam, acc_cam, depth_cam, extras_cam = render(H, W, K, chunk=args.chunk, rays=batch_rays,
                                                 verbose=i < 10, retraw=True,
                                                 **render_kwargs_train)
-
+        # Render Light Rays 
+        with torch.no_grad():
+            _, _, _, depth_light, _ = render(H, W, K_light, chunk=args.chunk, rays=light_rays,
+                                                verbose=i < 10, retraw=True,
+                                                **render_kwargs_train)
+        sm_coarse = None
+        # sm_coarse = efficient_sm_simple(cam_pixels, light_pixels, depth_cam, depth_light, ppc, light_ppc, (H,W), 'shadow_method_1')
+        sm_fine = efficient_sm_simple(cam_pixels, light_pixels, depth_cam, depth_light, ppc, light_ppc, (H//2,W//2), 'shadow_method_1')
+        print(sm_fine.shape, N_rand, light_pixels.shape, depth_cam.shape, depth_light.shape, target_s)
         optimizer.zero_grad()
-        img_loss = img2mse(rgb, target_s)
-        trans = extras['raw'][...,-1]
+        img_loss = img2mse(sm_fine, target_s)
+        trans = extras_cam['raw'][...,-1]
         loss = img_loss
         psnr = mse2psnr(img_loss)
-
-        if 'rgb0' in extras:
+        
+        if sm_coarse is not None:
+        # if 'rgb0' in extras:
             img_loss0 = img2mse(extras['rgb0'], target_s)
             loss = loss + img_loss0
             psnr0 = mse2psnr(img_loss0)

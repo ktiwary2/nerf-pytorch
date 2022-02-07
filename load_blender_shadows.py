@@ -34,7 +34,7 @@ def pose_spherical(theta, phi, radius):
     return c2w
 
 
-def load_blender_shadows(basedir, half_res=False, testskip=1):
+def load_blender_shadows(basedir, half_res=False, testskip=1, quarter_res=False):
     splits = ['train', 'val', 'test']
     metas = {}
     for s in splits:
@@ -96,7 +96,20 @@ def load_blender_shadows(basedir, half_res=False, testskip=1):
         imgs = imgs_half_res
         # imgs = tf.image.resize_area(imgs, [400, 400]).numpy()
 
-        
+    # do a (100,100) Image Instead
+    if quarter_res:
+        H = H//4
+        W = W//4
+        focal = focal/4.
+        light_camera_focal = light_camera_focal/4.
+
+        imgs_quarter_res = np.zeros((imgs.shape[0], H, W, imgs[0].shape[2]))
+        for i, img in enumerate(imgs):
+            imgs_quarter_res[i] = cv2.resize(img, (W, H), interpolation=cv2.INTER_AREA)
+        imgs = imgs_quarter_res
+
+
+    print("Final H,W,Focal: {},{},{}".format(H, W, focal, light_camera_focal))
     return imgs, poses, render_poses, [H, W, focal], i_split, light_camera_focal, l2w
 
 

@@ -531,6 +531,8 @@ def config_parser():
                         help='set to render synthetic data on a white bkgd (always use for dvoxels)')
     parser.add_argument("--half_res", action='store_true', 
                         help='load blender synthetic data at 400x400 instead of 800x800')
+    parser.add_argument("--quarter_res", action='store_true', 
+                        help='load blender synthetic data at 100x00 instead of 800x800')
 
     ## llff flags
     parser.add_argument("--factor", type=int, default=8, 
@@ -584,7 +586,8 @@ def train():
 
     elif args.dataset_type == 'blender_sm':
         print('Loading Blender Shadows...')
-        images, poses, render_poses, hwf, i_split, light_camera_focal, l2w = load_blender_shadows(args.datadir, args.half_res, args.testskip)
+        images, poses, render_poses, hwf, i_split, light_camera_focal, l2w = load_blender_shadows(args.datadir,
+            args.half_res, args.testskip, args.quarter_res)
         # if args.white_bkgd:
         #     images = images[...,:3]*images[...,-1:] + (1.-images[...,-1:])
         # else:
@@ -655,35 +658,35 @@ def train():
     l2w = l2w[:3,:4]
     rays_o, rays_d = get_rays(H, W, K_light, l2w)  # (H, W, 3), (H, W, 3)
 
-    CROP_LIGHT = True
-    if CROP_LIGHT:
-        dH = int(H//2 * args.precrop_frac)
-        dW = int(W//2 * args.precrop_frac)
-        pixels_u = torch.linspace(H//2 - dH, H//2 + dH - 1, 2*dH)
-        pixels_v = torch.linspace(W//2 - dW, W//2 + dW - 1, 2*dW)
-        i, j = np.meshgrid(pixels_v.cpu().numpy(), pixels_u.cpu().numpy(), indexing='xy')
-        i = torch.tensor(i)
-        j = torch.tensor(j)
-        light_pixels = torch.stack([i,j, torch.ones_like(i)], -1).view(-1, 3) # (H*W,3)
-        print("Cropping Light...")                
-    else:
-        pixels_u = torch.arange(0, w, 1)
-        pixels_v = torch.arange(0, h, 1)
-        i, j = np.meshgrid(pixels_v.cpu().numpy(), pixels_u.cpu().numpy(), indexing='xy')
-        i = torch.tensor(i) # + 0.5 #.unsqueeze(2) 
-        j = torch.tensor(j) #+ 0.5 #.unsqueeze(2)
-        light_pixels = torch.stack([i,j, torch.ones_like(i)], axis=-1).view(-1, 3) # (H*W,3)
-    
-    rays_o = rays_o[i.long(), j.long()]  # (H * W, 3)
-    rays_d = rays_d[i.long(), j.long()]  # (H * W, 3)
+    print("Cropping Light...")
+    dH = int(H//2 * args.precrop_frac)
+    dW = int(W//2 * args.precrop_frac)
+    pixels_u = torch.linspace(H//2 - dH, H//2 + dH - 1, 2*dH)
+    pixels_v = torch.linspace(W//2 - dW, W//2 + dW - 1, 2*dW)
+    i, j = np.meshgrid(pixels_v.cpu().numpy(), pixels_u.cpu().numpy(), indexing='xy')
+    i = torch.tensor(i)
+    j = torch.tensor(j)
+    cropped_light_pixels = torch.stack([i,j, torch.ones_like(i)], -1).view(-1, 3) # (H*W,3)
+    c_rays_o = rays_o[i.long(), j.long()]  # (H * W, 3)
+    c_rays_d = rays_d[i.long(), j.long()]  # (H * W, 3)
+    cropped_light_rays = torch.stack([c_rays_o, c_rays_d], 0).to(args.device)
+
+    # non-cropped lights
+    pixels_u = torch.arange(0, W, 1)
+    pixels_v = torch.arange(0, H, 1)
+    i, j = np.meshgrid(pixels_v.cpu().numpy(), pixels_u.cpu().numpy(), indexing='xy')
+    i = torch.tensor(i) # + 0.5 #.unsqueeze(2) 
+    j = torch.tensor(j) #+ 0.5 #.unsqueeze(2)
+    light_pixels = torch.stack([i,j, torch.ones_like(i)], axis=-1).view(-1, 3) # (H*W,3)
     light_rays = torch.stack([rays_o, rays_d], 0).to(args.device)
+    
     light_pixels = light_pixels.to(args.device)
-    print("light_pixels",light_pixels)
+    print("Light Characteristics",light_pixels) #, cropped_light_pixels)
+    print("Light Characteristics",light_pixels.shape) #, cropped_light_pixels.shape)
 
     light_ppc = Camera(light_camera_focal, (H,W))
     light_ppc.set_pose_using_blender_matrix(l2w.to(args.device), False)
     light_ppc.camera.to(args.device)
-    print("Light Characteristics: ", light_pixels.shape, light_rays.shape)
 
     # Short circuit if only rendering out from trained model
     if args.render_only:
@@ -741,14 +744,8 @@ def train():
     print('TEST views are', i_test)
     print('VAL views are', i_val)
 
-
     # Summary writers
     # writer = SummaryWriter(os.path.join(basedir, 'summaries', expname))
-    # with torch.no_grad():
-    #     _, _, _, depth_light, _ = render(H, W, K_light, chunk=args.chunk, rays=light_rays,
-    #                                             verbose=i < 10, retraw=True,
-    #                                             **render_kwargs_train)
-
     start = start + 1
     for i in trange(start, N_iters):
         time0 = time.time()
@@ -797,6 +794,9 @@ def train():
                     i_ = torch.tensor(i_)
                     j_ = torch.tensor(j_)
                     cam_pixels = torch.stack([i_,j_, torch.ones_like(i_)], -1).view(-1, 3) # (H*W,3)
+                    curr_light_pix = cropped_light_pixels
+                    curr_light_rays = cropped_light_rays
+                    Light_W, Light_H = W//2, H//2
                 else:
                     coords = torch.stack(torch.meshgrid(torch.linspace(0, H-1, H), torch.linspace(0, W-1, W)), -1)  # (H, W, 2)
                     pixels_u = torch.arange(0, W, 1)
@@ -805,6 +805,14 @@ def train():
                     i_ = torch.tensor(i_) # + 0.5 #.unsqueeze(2) 
                     j_ = torch.tensor(j_) #+ 0.5 #.unsqueeze(2)
                     cam_pixels = torch.stack([i_,j_, torch.ones_like(i_)], axis=-1).view(-1, 3) # (H*W,3)
+                
+                # currently hardcoding to use the full light map...
+                curr_light_pix = light_pixels
+                curr_light_rays = light_rays
+                Light_W, Light_H = W, H
+
+                if i == start: 
+                    print("cam_pixels", cam_pixels, curr_light_pix)
 
                 coords = torch.reshape(coords, [-1,2])  # (H * W, 2)
                 select_inds = np.random.choice(coords.shape[0], size=[N_rand], replace=False)  # (N_rand,)
@@ -813,11 +821,7 @@ def train():
                 rays_d = rays_d[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
                 batch_rays = torch.stack([rays_o, rays_d], 0)
                 target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
-                # print(cam_pixels)
                 cam_pixels = cam_pixels[select_inds].to(args.device)
-                # cam_pixels = torch.stack([select_coords[:, 0],select_coords[:, 1], torch.ones_like(select_coords[:, 0])], axis=-1).view(-1, 3)
-                # print(cam_pixels)
-                # raise
 
         #####  Core optimization loop  #####
         # Render Camera Rays 
@@ -825,14 +829,16 @@ def train():
                                                 verbose=i < 10, retraw=True,
                                                 **render_kwargs_train)
         # Render Light Rays 
-        with torch.no_grad():
-            _, _, _, depth_light, _ = render(H, W, K_light, chunk=args.chunk, rays=light_rays,
+        # with torch.no_grad():
+        _, _, _, depth_light, _ = render(H, W, K_light, chunk=args.chunk, rays=curr_light_rays,
                                                 verbose=i < 10, retraw=True,
                                                 **render_kwargs_train)
         sm_coarse = None
-        # sm_coarse = efficient_sm_simple(cam_pixels, light_pixels, depth_cam, depth_light, ppc, light_ppc, (H,W), 'shadow_method_1')
-        sm_fine = efficient_sm_simple(cam_pixels, light_pixels, depth_cam, depth_light, ppc, light_ppc, (H//2,W//2), 'shadow_method_1')
-        print(sm_fine.shape, N_rand, light_pixels.shape, depth_cam.shape, depth_light.shape, target_s)
+        # sm_coarse = efficient_sm_simple(cam_pixels, curr_light_pix, depth_cam, depth_light, ppc, light_ppc, (H,W), 'shadow_method_1')
+        sm_fine = efficient_sm_simple(cam_pixels, curr_light_pix, depth_cam, depth_light, ppc, light_ppc, 
+                                        (Light_H, Light_W), 'shadow_method_1')
+        if i == start:
+            print(sm_fine.shape, N_rand, curr_light_pix.shape, depth_cam.shape, depth_light.shape, target_s)
         optimizer.zero_grad()
         img_loss = img2mse(sm_fine, target_s)
         trans = extras_cam['raw'][...,-1]
@@ -889,6 +895,7 @@ def train():
             #     imageio.mimwrite(moviebase + 'rgb_still.mp4', to8b(rgbs_still), fps=30, quality=8)
 
         if i%args.i_testset==0 and i > 0:
+            print("Running On test...")
             testsavedir = os.path.join(basedir, expname, 'testset_{:06d}'.format(i))
             os.makedirs(testsavedir, exist_ok=True)
             print('test poses shape', poses[i_test].shape)
@@ -910,13 +917,13 @@ def train():
 
 
             if i%args.i_img==0:
-                
                 # Log a rendered validation view to Tensorboard
+                print("Running Saving Images...")
                 img_i=np.random.choice(i_val)
                 target = images[img_i]
                 pose = poses[img_i, :3,:4]
                 with torch.no_grad():
-                    rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, c2w=pose,
+                    rgb, disp, acc, depth, extras = render(H, W, K, chunk=args.chunk, c2w=pose,
                                                         **render_kwargs_test)
 
                 psnr = mse2psnr(img2mse(rgb, torch.tensor(target).to(rgb.device)))

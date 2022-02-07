@@ -12,6 +12,7 @@ EPSILON = 1e-5
 def efficient_sm_simple(cam_pixels, light_pixels, cam_depth, light_depth, 
                  single_ppc, light_ppc, image_shape, shadow_method):
 
+    print(cam_pixels.shape, cam_depth.shape)
     mesh_range_cam = torch.cat([cam_pixels, cam_depth.view(-1,1)], dim=1)
     mesh_range_light = torch.cat([light_pixels, light_depth.view(-1,1)], dim=1)
     meshed_normed_light = eff_sm.get_normed_w(light_ppc, mesh_range_light, device=mesh_range_light.device)
